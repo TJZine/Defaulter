@@ -20,7 +20,28 @@ services:
     environment:
       - TZ=Europe/London
       - LOG_LEVEL=info
-``` 
+```
+
+### Automated Docker builds
+
+Forks hosted on GitHub can use the included **Build and publish Docker image**
+workflow (`.github/workflows/docker-publish.yml`) to automatically produce and
+publish container images to the GitHub Container Registry (GHCR).
+
+1. Enable GitHub Actions for your fork (required for public forks) and ensure
+   the repository has permission to publish packages (Settings → Actions →
+   General → Workflow permissions → "Read and write" for the `GITHUB_TOKEN`).
+2. Optionally adjust the workflow's `IMAGE_NAME` environment variable if you
+   prefer a different image name than `defaulterr`.
+3. Push to `main`, create a tag (e.g. `v1.2.3`), or run the workflow manually
+   from the Actions tab—builds on branches and tags are automatically pushed to
+   `ghcr.io/<owner>/<image>` with sensible tags (branch, tag, commit SHA, and
+   `latest` for `main`).
+4. Update your deployment manifests to reference the published image (for
+   example `ghcr.io/<owner>/defaulterr:latest`).
+
+Pull requests still build the image but skip the push step, allowing
+verification without publishing.
 
 ### Unraid Template
 Click [here](https://raw.githubusercontent.com/varthe/Defaulterr/refs/heads/main/defaulterr.xml) to download the Unraid template.
@@ -49,6 +70,7 @@ See [config.yaml](https://github.com/varthe/Defaulterr/blob/main/config.yaml) fo
   - **WARNING**: The first run may take a LONG time to complete as it will update all existing media. Subsequent runs will only update any new items added since the last run.
 - **partial_run_cron_expression**: Specify a cron expression (e.g., `0 3 * * *` for daily at 3:00 AM) to do a partial run on a schedule. You can create and check cron expressions at [https://crontab.guru/](https://crontab.guru/).
 - **clean_run_on_start**: Set to `True` to update all existing media on application start. Should only be used if you want to re-apply a new set of filters on your libraries.
+- **skipInaccessibleItems**: Set to `True` to skip per-user updates that return HTTP 403 because the user can't access the item. When enabled the run will continue, log skip counts per user, and finish with exit code `0`. Defaults to `False`. You can also enable it via the `SKIP_INACCESSIBLE_ITEMS` environment variable.
 
 #### GROUPS
 
