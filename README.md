@@ -20,7 +20,28 @@ services:
     environment:
       - TZ=Europe/London
       - LOG_LEVEL=info
-``` 
+```
+
+### Automated Docker builds
+
+Forks hosted on GitHub can use the included **Build and publish Docker image**
+workflow (`.github/workflows/docker-publish.yml`) to automatically produce and
+publish container images to the GitHub Container Registry (GHCR).
+
+1. Enable GitHub Actions for your fork (required for public forks) and ensure
+   the repository has permission to publish packages (Settings → Actions →
+   General → Workflow permissions → "Read and write" for the `GITHUB_TOKEN`).
+2. Optionally adjust the workflow's `IMAGE_NAME` environment variable if you
+   prefer a different image name than `defaulterr`.
+3. Push to `main`, create a tag (e.g. `v1.2.3`), or run the workflow manually
+   from the Actions tab—builds on branches and tags are automatically pushed to
+   `ghcr.io/<owner>/<image>` with sensible tags (branch, tag, commit SHA, and
+   `latest` for `main`).
+4. Update your deployment manifests to reference the published image (for
+   example `ghcr.io/<owner>/defaulterr:latest`).
+
+Pull requests still build the image but skip the push step, allowing
+verification without publishing.
 
 ### Unraid Template
 Click [here](https://raw.githubusercontent.com/varthe/Defaulterr/refs/heads/main/defaulterr.xml) to download the Unraid template.
