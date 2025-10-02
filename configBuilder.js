@@ -19,6 +19,7 @@ const schema = {
         partial_run_on_start: { type: "boolean" },
         partial_run_cron_expression: { type: "string" },
         clean_run_on_start: { type: "boolean" },
+        skipInaccessibleItems: { type: "boolean" },
         managed_users: {
             type: "object",
             additionalProperties: { type: "string" },
@@ -238,6 +239,7 @@ const loadAndValidateYAML = () => {
 
         logger.info("Validated and loaded config file")
         jsonData.plex_server_url = normalizeUrl(jsonData.plex_server_url)
+        if (typeof jsonData.skipInaccessibleItems !== "boolean") jsonData.skipInaccessibleItems = false
         return jsonData
     } catch (error) {
         logger.error(`Error loading or validating YAML: ${error.message}`)
