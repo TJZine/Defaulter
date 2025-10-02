@@ -72,32 +72,38 @@ See [config.yaml](https://github.com/varthe/Defaulterr/blob/main/config.yaml) fo
 - **clean_run_on_start**: Set to `True` to update all existing media on application start. Should only be used if you want to re-apply a new set of filters on your libraries.
 - **skipInaccessibleItems**: Set to `True` to skip per-user updates that return HTTP 403 because the user can't access the item. When enabled the run will continue, log skip counts per user, and finish with exit code `0`. Defaults to `False`. You can also enable it via the `SKIP_INACCESSIBLE_ITEMS` environment variable.
 
-#### DIAGNOSTIC FLAGS & ENVIRONMENT VARIABLES
+## Diagnostics & Observability
 
-Additional runtime switches control the new diagnostics tooling. CLI options always override environment variables, which override the values defined in `config.yaml`.
+Diagnostics are opt-in and disabled by default so an upgrade preserves historic logging behaviour. Enable only what you need for a run—the CLI flag always wins over an environment variable, which in turn overrides the configuration file.
 
-| CLI flag | Environment variable | Description |
-| --- | --- | --- |
-| `--log-user-summary[=true|false]` | `LOG_USER_SUMMARY` | Emit a human-readable per-item, per-group summary after each update. |
-| `--log-json-user-summary[=true|false]` | `LOG_JSON_USER_SUMMARY` | Emit a machine-friendly JSON summary line alongside (or instead of) the human summary. |
-| `--audit-dir=<path>` | `AUDIT_DIR` | Write per-run audit reports to the given directory (JSON + CSV). Files are created as `run-YYYYMMDD-HHMMSS.json` / `.csv`. |
-| `--dry-run` | `DRY_RUN` | Shortcut to enable dry-run mode without editing the config file. |
+### Flag precedence & defaults
 
-Example JSON summary:
+| CLI flag | Environment variable | Default | Description |
+| --- | --- | --- | --- |
+| `--log-user-summary[=true|false]` | `LOG_USER_SUMMARY` | `false` | Emit a human-readable per-item, per-group summary after each update. |
+| `--log-json-user-summary[=true|false]` | `LOG_JSON_USER_SUMMARY` | `false` | Emit a machine-friendly JSON summary line alongside (or instead of) the human summary. Implies the human summary when enabled. |
+| `--audit-dir=<path>` | `AUDIT_DIR` | disabled | Write per-run audit reports to the given directory (JSON + CSV). Files are created as `run-YYYYMMDD-HHMMSS.json` / `.csv`. |
+| `--dry-run` | `DRY_RUN` | `false` | Shortcut to enable dry-run mode without editing the config file. |
 
-```
-[INFO]: {"event":"user_updates","group":"noLossless","partId":23614,"title":"1917","library":"Movies Home","users":[{"name":"keltonsnyder","audio":{"id":12345,"label":"AC3 5.1"},"status":"success"},{"name":"rossni6","status":"skipped","reason":"HTTP 403"}]}
-```
+### Logging modes
 
-Example human-readable summary:
+When summaries are enabled, two formats are available:
 
-```
-[INFO]: User updates (group=noLossless, part=23614, title='1917'):
-  keltonsnyder: audio='AC3 5.1' (id=12345) [success]
-  rossni6: [skipped: HTTP 403]
-```
+* **Human-readable** summaries are compact and optimized for console review:
 
-When a run starts, Defaulterr emits a startup digest and an owner-safety message to make it clear which groups will run and whether the Plex owner is included:
+  ```
+  [INFO]: User updates (group=noLossless, part=23614, title='1917'):
+    keltonsnyder: audio='AC3 5.1' (id=12345) [success]
+    rossni6: [skipped: HTTP 403]
+  ```
+
+* **JSON** summaries are single-line payloads that parse cleanly with `jq` or any JSON parser:
+
+  ```
+  [INFO]: {"event":"user_updates","group":"noLossless","partId":23614,"title":"1917","library":"Movies Home","users":[{"name":"keltonsnyder","audio":{"id":12345,"label":"AC3 5.1"},"status":"success"},{"name":"rossni6","status":"skipped","reason":"HTTP 403"}]}
+  ```
+
+The JSON mode includes every field from the human summary plus HTTP status codes when available, and the owner account is omitted unless explicitly placed in a group. Startup also emits a digest and owner-safety notice so operators can confirm membership ahead of the run:
 
 ```
 [INFO]: Group digest (library='Movies Home'):
@@ -106,13 +112,30 @@ When a run starts, Defaulterr emits a startup digest and an owner-safety message
 [INFO]: Owner 'Tristan' is not included in any group; no owner updates will be performed.
 ```
 
-If the owner is intentionally targeted the message becomes a warning so it stands out during reviews.
+### Audit exports
 
-#### AUDIT OUTPUTS
+Providing `--audit-dir` (or setting `AUDIT_DIR`) enables structured per-run audit exports. Each run writes two files—`run-YYYYMMDD-HHMMSS.json` and `run-YYYYMMDD-HHMMSS.csv`—with one row per `(group × user × item × actionType)` attempt.
 
-Providing `--audit-dir` (or setting `AUDIT_DIR`) enables structured per-run audit exports. Each run writes two files—`run-YYYYMMDD-HHMMSS.json` and `run-YYYYMMDD-HHMMSS.csv`—with one row per `(group, user, item)` attempt. Columns include timestamps, library names, rating keys, stream transitions, HTTP status codes, duration, and final status (`success`, `skipped`, `error`, or `dry_run`).
+| Field | Description |
+| --- | --- |
+| `timestamp` | ISO timestamp when the attempt started. |
+| `libraryName` | Library containing the media item. |
+| `ratingKey` / `partId` | Plex identifiers for the item and part being updated. |
+| `title` | Human-friendly title of the item. |
+| `group` / `user` | Configured group and username being updated. |
+| `actionType` | `audio`, `subtitles`, or `audio+subtitles` depending on the streams touched. |
+| `fromStreamId` / `fromLabel` | Previous stream identifiers and labels (if known). |
+| `toStreamId` / `toLabel` | Target stream identifiers and labels requested. |
+| `status` | `success`, `skipped`, `error`, or `dry_run`. |
+| `reason` | Short diagnostic (e.g. `HTTP 403`, `no_token`). |
+| `httpStatus` | HTTP response code when available. |
+| `durationMs` | Time spent on the attempt. |
 
-Audit files are written incrementally with buffered streams to keep the runtime overhead low. Disable the flag (default) to skip audit generation entirely.
+The JSON export is a simple array of objects with these fields; the CSV uses the same header order for quick spreadsheet imports. Tokens are never written in full—any time a token surfaces in logs it is masked to `***…LAST6`.
+
+### Managed user caveats
+
+Managed accounts remain supported and keep the same configuration syntax as before. Diagnostics help confirm that Defaulterr updates only the accounts you intend, but Plex itself stores some preferences per underlying account. If multiple managed profiles reuse a single token, Plex may still apply changes across them. The audit trail and per-user headers make the script’s actions transparent so you can distinguish Defaulterr activity from Plex-side behaviour.
 
 #### GROUPS
 
@@ -223,6 +246,28 @@ filters:
                   exclude:
                     extendedDisplayTitle: signs
 ```
+
+## Diagnostics Acceptance Criteria
+
+These diagnostics are considered production-ready when the following conditions are met:
+
+* Upgrading without new flags preserves legacy logging output and runtime behaviour.
+* Enabling the logging flags produces the documented human and JSON summaries with valid JSON payloads.
+* Startup digests list the correct members, token resolution counts, and owner-safety notice, with missing tokens warned once per run.
+* Audit exports create JSON and CSV files with one row per attempt and the schema shown above.
+* All sensitive tokens are masked everywhere outside of configuration storage.
+* Per-user HTTP requests always include the intended token and never reuse a default/owner credential for another account.
+* Automated tests cover success, dry-run, missing token, HTTP 403, JSON validation, audit I/O, and per-request header isolation.
+
+## Manual Diagnostics Verification Plan
+
+Operators who prefer a hands-on validation can follow this checklist after deploying an update:
+
+1. **Baseline run** – Execute a small partial run with diagnostics flags left at their defaults to confirm logs match the pre-upgrade format.
+2. **Human summaries** – Re-run with `--log-user-summary` to confirm the concise per-item summaries list the expected users and statuses.
+3. **JSON summaries** – Add `--log-json-user-summary` and pipe the log through `jq '.'` to validate that each JSON line parses cleanly and contains the documented keys.
+4. **Audit exports** – Enable `--audit-dir=/tmp/audit-test`, process a few items, and spot-check that the CSV/JSON row counts match the attempted updates and that tokens appear masked in any warnings.
+5. **Session isolation** – Temporarily supply an invalid token for a single user and confirm only that user is skipped (with `HTTP 403` or `no_token`), while other users continue succeeding.
 
 ### Tautulli Webhook Integration
 
