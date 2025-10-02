@@ -5,6 +5,8 @@ const logger = require("./logger")
 const cron = require("node-cron")
 const cronValidator = require("cron-validator")
 const xml2js = require("xml2js")
+const cliOptions = require("./cliOptions")
+const AuditWriter = require("./auditWriter")
 const loadAndValidateYAML = require("./configBuilder")
 
 const parseBoolean = (value) => {
@@ -18,16 +20,40 @@ const parseBoolean = (value) => {
 }
 
 const config = loadAndValidateYAML()
-const envSkipInaccessibleItems = parseBoolean(process.env.SKIP_INACCESSIBLE_ITEMS)
-if (typeof envSkipInaccessibleItems === "boolean") {
-    config.skipInaccessibleItems = envSkipInaccessibleItems
+
+const getBooleanOption = (flagName, envName, configKey, defaultValue = false) => {
+    const cliValue = cliOptions.getFlag(flagName)
+    if (typeof cliValue === "boolean") return cliValue
+    const envValue = parseBoolean(process.env[envName])
+    if (typeof envValue === "boolean") return envValue
+    if (typeof config[configKey] === "boolean") return config[configKey]
+    return defaultValue
 }
+
+const getStringOption = (flagName, envName, configKey) => {
+    const cliValue = cliOptions.getFlag(flagName)
+    if (typeof cliValue === "string" && cliValue.length > 0) return cliValue
+    const envValue = process.env[envName]
+    if (envValue && envValue.length > 0) return envValue
+    if (typeof config[configKey] === "string" && config[configKey].length > 0) return config[configKey]
+    return undefined
+}
+
+config.skipInaccessibleItems = getBooleanOption("skipInaccessibleItems", "SKIP_INACCESSIBLE_ITEMS", "skipInaccessibleItems", false)
+config.dry_run = getBooleanOption("dryRun", "DRY_RUN", "dry_run", config.dry_run)
+config.logUserSummary = getBooleanOption("logUserSummary", "LOG_USER_SUMMARY", "logUserSummary", false)
+config.logJsonUserSummary = getBooleanOption("logJsonUserSummary", "LOG_JSON_USER_SUMMARY", "logJsonUserSummary", false)
+config.auditDir = getStringOption("auditDir", "AUDIT_DIR", "auditDir")
+
+const timestampsFile =
+    getStringOption("timestamps", "TIMESTAMPS_FILE", undefined) || cliOptions.positional[2] || "./last_run_timestamps.json"
 const app = express()
 app.use(express.json())
 
 const STREAM_TYPES = { video: 1, audio: 2, subtitles: 3 }
 const LIBRARIES = new Map()
 const USERS = new Map()
+const missingTokenWarnings = new Set()
 const runStats = {
     processed: 0,
     succeeded: 0,
@@ -35,7 +61,6 @@ const runStats = {
     skipped: 0,
     skippedByUser: {},
 }
-const timestampsFile = process.argv[4] || "./last_run_timestamps.json"
 
 const resetRunStats = () => {
     runStats.processed = 0
@@ -61,6 +86,58 @@ const logRunSummary = () => {
     Object.entries(runStats.skippedByUser).forEach(([user, count]) => {
         logger.info(`skippedInaccessibleItemsByUser[${user}] = ${count}`)
     })
+}
+
+const getGroupMembers = (groupName) => {
+    const groupMembers = config.groups?.[groupName] || []
+    if (groupMembers.includes("$ALL")) {
+        return [...USERS.keys()]
+    }
+    return [...new Set(groupMembers)]
+}
+
+const logGroupDigest = () => {
+    Object.entries(config.filters || {}).forEach(([libraryName, libraryGroups]) => {
+        logger.info(`Group digest (library='${libraryName}'):`)
+        Object.keys(libraryGroups || {}).forEach((groupName) => {
+            const members = getGroupMembers(groupName)
+            const resolvedMembers = members.filter((member) => USERS.has(member))
+            const missingMembers = members.filter((member) => !USERS.has(member))
+            const memberList = members.length > 0 ? members.join(",") : "none"
+
+            logger.info(`  - ${groupName}: members=${memberList} (${members.length})`)
+            logger.info(
+                `    resolvedTokens: ${resolvedMembers.length}/${members.length || 0} ${
+                    missingMembers.length === 0 ? "ok" : "missing"
+                }; restrictedAccess: ${missingMembers.length} (updates skipped for missing tokens)`
+            )
+
+            missingMembers.forEach((member) => {
+                const key = `${groupName}|${member}`
+                if (missingTokenWarnings.has(key)) return
+                missingTokenWarnings.add(key)
+                logger.warn(`no token for user '${member}' in group '${groupName}' -> will skip updates for this user`)
+            })
+        })
+    })
+}
+
+const logOwnerSafety = () => {
+    if (!config.plex_owner_name) return
+    const owner = config.plex_owner_name
+    const groupsContainingOwner = Object.entries(config.groups || {})
+        .filter(([, members]) => members.includes(owner) || members.includes("$ALL"))
+        .map(([name]) => name)
+
+    if (groupsContainingOwner.length === 0) {
+        logger.info(`Owner '${owner}' is not included in any group; no owner updates will be performed.`)
+    } else {
+        logger.warn(
+            `Owner '${owner}' appears in groups: [${groupsContainingOwner.join(", ")}]`.concat(
+                " Proceeding with owner updates per config."
+            )
+        )
+    }
 }
 
 const warnAboutSharedTokens = () => {
@@ -321,6 +398,9 @@ const evaluateStreams = (streams, filters) => {
             return {
                 id: defaultStream.id,
                 extendedDisplayTitle: defaultStream.extendedDisplayTitle,
+                displayTitle: defaultStream.displayTitle,
+                language: defaultStream.language,
+                codec: defaultStream.codec,
                 onMatch: filter.on_match || {},
             }
     }
@@ -344,13 +424,13 @@ const fetchStreamsForItem = async (itemId) => {
         const part = data?.MediaContainer?.Metadata[0]?.Media[0]?.Part[0]
         if (!part || !part.id || !part.Stream) {
             logger.warn(`Item ID ${itemId} '${title}' has invalid media structure. Skipping.`)
-            return { partId: itemId, title: title || 'title unknown', streams: [] }
+            return { ratingKey: metadata?.ratingKey || itemId, partId: itemId, title: title || 'title unknown', streams: [] }
         }
         const streams = part.Stream.filter((stream) => stream.streamType !== STREAM_TYPES.video)
-        return { partId: part.id, title: title, streams: streams }
+        return { ratingKey: metadata?.ratingKey || itemId, partId: part.id, title: title, streams: streams }
     } catch (error) {
         handleAxiosError(`fetching streams for Item ID ${itemId}`, error)
-        return { partId: itemId, title: 'title unknown', streams: [] } // Return empty streams on error
+        return { ratingKey: itemId, partId: itemId, title: 'title unknown', streams: [] } // Return empty streams on error
     }
 }
 
@@ -444,7 +524,29 @@ const identifyStreamsToUpdate = async (parts, filters) => {
                 continue
             }
 
-            const partUpdate = { partId: part.partId, title: part.title }
+            const partUpdate = { partId: part.partId, title: part.title, ratingKey: part.ratingKey }
+
+            const audioStreams = part.streams.filter((stream) => stream.streamType === STREAM_TYPES.audio)
+            const subtitleStreams = part.streams.filter((stream) => stream.streamType === STREAM_TYPES.subtitles)
+
+            const selectedAudio = audioStreams.find((stream) => stream.selected === 1 || stream.selected === "1" || stream.selected === true)
+            if (selectedAudio) {
+                partUpdate.fromAudioStreamId = selectedAudio.id
+                partUpdate.fromAudioStreamLabel =
+                    selectedAudio.extendedDisplayTitle || selectedAudio.displayTitle || selectedAudio.language || "unknown"
+            }
+
+            const selectedSubtitle = subtitleStreams.find(
+                (stream) => stream.selected === 1 || stream.selected === "1" || stream.selected === true
+            )
+            if (selectedSubtitle) {
+                partUpdate.fromSubtitleStreamId = selectedSubtitle.id
+                partUpdate.fromSubtitleStreamLabel =
+                    selectedSubtitle.extendedDisplayTitle ||
+                    selectedSubtitle.displayTitle ||
+                    selectedSubtitle.language ||
+                    "unknown"
+            }
 
             let audio = findMatchingAudioStream(part, filters.audio) || {}
             let subtitles = findMatchingSubtitleStream(part, filters.subtitles) || {}
@@ -459,12 +561,17 @@ const identifyStreamsToUpdate = async (parts, filters) => {
 
             if (audio.id) {
                 partUpdate.audioStreamId = audio.id
+                partUpdate.audioStreamLabel = audio.extendedDisplayTitle || audio.displayTitle || audio.language || audio.codec
                 logger.info(`Part ID ${part.partId} ('${part.title}'): match found for audio stream ${audio.extendedDisplayTitle}`)
             } else {
                 logger.debug(`Part ID ${part.partId} ('${part.title}'): no match found for audio streams`)
             }
             if (subtitles.id >= 0) {
                 partUpdate.subtitleStreamId = subtitles.id
+                partUpdate.subtitleStreamLabel =
+                    subtitles.id === 0
+                        ? "Disabled"
+                        : subtitles.extendedDisplayTitle || subtitles.displayTitle || subtitles.language || subtitles.codec
                 logger.info(
                     `Part ID ${part.partId} ('${part.title}'): ${
                         subtitles.id === 0
@@ -488,110 +595,291 @@ const identifyStreamsToUpdate = async (parts, filters) => {
 }
 
 // Update default streams for a single item across all relevant users
-const updateDefaultStreamsPerItem = async (streamsToUpdate, filters, users) => {
+const maskToken = (token) => {
+    if (!token) return "(none)"
+    const normalized = token.toString().trim()
+    if (normalized.length <= 6) return "*".repeat(normalized.length)
+    return `${"*".repeat(normalized.length - 6)}${normalized.slice(-6)}`
+}
+
+const auditWriter = new AuditWriter(config.auditDir)
+let auditWriterClosed = false
+const closeAuditWriter = () => {
+    if (auditWriterClosed) return
+    auditWriter.close()
+    auditWriterClosed = true
+}
+
+const describeActionType = (stream) => {
+    const audio = Boolean(stream.audioStreamId)
+    const subtitles = stream.subtitleStreamId !== undefined && stream.subtitleStreamId >= 0
+    if (audio && subtitles) return "audio+subtitles"
+    if (audio) return "audio"
+    if (subtitles) return "subtitles"
+    return "none"
+}
+
+const buildStreamTransition = (stream) => {
+    const fromIds = []
+    const fromLabels = []
+    const toIds = []
+    const toLabels = []
+
+    if (stream.audioStreamId) {
+        fromIds.push(stream.fromAudioStreamId ?? "")
+        fromLabels.push(stream.fromAudioStreamLabel || "")
+        toIds.push(stream.audioStreamId)
+        toLabels.push(stream.audioStreamLabel || "")
+    }
+
+    if (stream.subtitleStreamId !== undefined && stream.subtitleStreamId >= 0) {
+        fromIds.push(stream.fromSubtitleStreamId ?? "")
+        fromLabels.push(stream.fromSubtitleStreamLabel || "")
+        toIds.push(stream.subtitleStreamId)
+        toLabels.push(stream.subtitleStreamLabel || "")
+    }
+
+    return {
+        fromStreamId: fromIds.join("|") || null,
+        fromLabel: fromLabels.join(" | ") || null,
+        toStreamId: toIds.join("|") || null,
+        toLabel: toLabels.join(" | ") || null,
+    }
+}
+
+const emitUserSummary = (summary) => {
+    if (!config.logUserSummary && !config.logJsonUserSummary) return
+
+    if (config.logJsonUserSummary) {
+        logger.info(
+            JSON.stringify({
+                event: "user_updates",
+                group: summary.group,
+                partId: summary.partId,
+                title: summary.title,
+                library: summary.libraryName,
+                users: summary.users.map((user) => {
+                    const payload = { name: user.name, status: user.status }
+                    if (user.reason) payload.reason = user.reason
+                    if (user.httpStatus) payload.httpStatus = user.httpStatus
+                    if (user.audio) payload.audio = user.audio
+                    if (user.subtitles) payload.subtitles = user.subtitles
+                    return payload
+                }),
+            })
+        )
+    }
+
+    if (config.logUserSummary) {
+        const header = `User updates (group=${summary.group}, part=${summary.partId}, title='${summary.title}'):`
+        const lines = summary.users.map((user) => {
+            const pieces = [`${user.name}:`]
+            if (user.audio) pieces.push(`audio='${user.audio.label}' (id=${user.audio.id})`)
+            if (user.subtitles)
+                pieces.push(
+                    user.subtitles.id === 0
+                        ? "subtitles=disabled"
+                        : `subtitles='${user.subtitles.label}' (id=${user.subtitles.id})`
+                )
+            pieces.push(
+                user.status === "success"
+                    ? "[success]"
+                    : user.status === "skipped"
+                    ? `[skipped: ${user.reason || "unknown"}]`
+                    : `[error: ${user.reason || "unknown"}]`
+            )
+            return `  ${pieces.join(" ")}`
+        })
+        logger.info(`${header}\n${lines.join("\n")}`)
+    }
+}
+
+const updateDefaultStreamsPerItem = async (libraryName, streamsToUpdate, users) => {
     for (const group in streamsToUpdate) {
         for (const stream of streamsToUpdate[group]) {
             const usernames = users.get(group)
-            if (usernames.length === 0) {
+            if (!usernames || usernames.length === 0) {
                 logger.warn(`No users found in group '${group}'. Skipping update.`)
                 continue
             }
+
+            const summary = {
+                libraryName,
+                group,
+                partId: stream.partId,
+                title: stream.title,
+                users: [],
+            }
+
+            const queryParams = new URLSearchParams()
+            if (stream.audioStreamId) queryParams.append("audioStreamID", stream.audioStreamId)
+            if (stream.subtitleStreamId >= 0) queryParams.append("subtitleStreamID", stream.subtitleStreamId)
+
             for (const username of usernames) {
-                let skipUpdate = false
-                let finalStatus
                 const token = USERS.get(username)
+                const userSummary = { name: username }
+                if (stream.audioStreamId) {
+                    userSummary.audio = { id: stream.audioStreamId, label: stream.audioStreamLabel || "" }
+                }
+                if (stream.subtitleStreamId >= 0) {
+                    userSummary.subtitles = {
+                        id: stream.subtitleStreamId,
+                        label: stream.subtitleStreamLabel || "",
+                    }
+                }
+
                 if (!token) {
                     logger.warn(`No access token found for user ${username}. Skipping update.`)
+                    userSummary.status = "skipped"
+                    userSummary.reason = "no_token"
+                    summary.users.push(userSummary)
+                    const transition = buildStreamTransition(stream)
+                    auditWriter.append({
+                        timestamp: new Date().toISOString(),
+                        libraryName,
+                        ratingKey: stream.ratingKey,
+                        partId: stream.partId,
+                        title: stream.title,
+                        group,
+                        user: username,
+                        actionType: describeActionType(stream),
+                        ...transition,
+                        status: "skipped",
+                        reason: "no_token",
+                    })
                     continue
                 }
-                const queryParams = new URLSearchParams()
-                if (stream.audioStreamId) queryParams.append("audioStreamID", stream.audioStreamId)
-                if (stream.subtitleStreamId >= 0) queryParams.append("subtitleStreamID", stream.subtitleStreamId)
+
+                const userClient = axios.create({
+                    baseURL: config.plex_server_url,
+                    timeout: 600000,
+                    headers: {
+                        "X-Plex-Token": token,
+                        "X-Plex-Client-Identifier": config.plex_client_identifier,
+                        "X-Plex-Device-Name": `Defaulter/${username}`,
+                        ...(username ? { "X-Plex-Username": username } : {}),
+                    },
+                })
 
                 runStats.processed++
+                const startTime = Date.now()
+                let skipUpdate = false
+                let httpStatus
+                let reason
 
-                try {
-                    let response
+                let response
+                let attempt = 0
+                let fatalError = false
+                while (attempt < 10 && !response && !skipUpdate) {
                     try {
-                        response = await axiosInstance.post(
-                            `/library/parts/${stream.partId}?${queryParams.toString()}`,
-                            {},
-                            { headers: { "X-Plex-Token": token } }
-                        )
-                        finalStatus = response.status
+                        response = await userClient.post(`/library/parts/${stream.partId}?${queryParams.toString()}`)
+                        httpStatus = response.status
+                        if (response.status === 200) {
+                            runStats.succeeded++
+                            userSummary.status = "success"
+                            userSummary.httpStatus = response.status
+                        } else {
+                            runStats.failed++
+                            userSummary.status = "error"
+                            reason = `HTTP ${response.status}`
+                            userSummary.reason = reason
+                            userSummary.httpStatus = response.status
+                        }
                     } catch (error) {
-                        const statusCode = error.response?.status ?? error.status
-                        if (statusCode === 403 && config.skipInaccessibleItems) {
+                        httpStatus = error.response?.status
+                        if (httpStatus === 403 && config.skipInaccessibleItems) {
                             skipUpdate = true
                             recordSkipForUser(username)
+                            reason = "HTTP 403"
+                            userSummary.status = "skipped"
+                            userSummary.reason = "HTTP 403"
+                            userSummary.httpStatus = httpStatus
                             const itemLabel = stream.title
                                 ? `'${stream.title}' (Part ID ${stream.partId})`
                                 : `Part ID ${stream.partId}`
                             logger.warn(
-                                `Skipping item ${itemLabel} for user ${username} in group ${group}: inaccessible (HTTP 403).`
+                                `Skipping item ${itemLabel} for user ${username} in group ${group}: inaccessible (HTTP 403, token ${maskToken(
+                                    token
+                                )}).`
                             )
                         } else {
+                            reason = error.message || error.response?.statusText || "Unknown error"
+                            userSummary.status = "error"
+                            userSummary.reason = reason
+                            userSummary.httpStatus = httpStatus
                             const messageSuffix =
-                                statusCode === 403
+                                httpStatus === 403
                                     ? ". This could be because of age ratings, ensure they can access ALL items in the library"
                                     : ""
-                            const baseMessage = error.message || error.response?.statusText || "Unknown error"
-                            logger.error(
-                                `Error while posting update for user ${username} in group ${group}${messageSuffix}: ${baseMessage}. Retrying in 30 sec...`
-                            )
-                            await delay(30000)
-                            let responseStatus = ""
-                            let attempt = 1
-                            while (responseStatus !== 200 && attempt < 10) {
-                                try {
-                                    response = await axiosInstance.post(
-                                        `/library/parts/${stream.partId}?${queryParams.toString()}`,
-                                        {},
-                                        { headers: { "X-Plex-Token": token } }
-                                    )
-                                    responseStatus = response.status
-                                } catch (retryError) {
-                                    logger.error(
-                                        `Attempt ${attempt}/10 failed with error: ${retryError.message}. Retrying in 30 sec...`
-                                    )
-                                }
-                                if (responseStatus !== 200) {
-                                    attempt++
-                                    await delay(30000)
-                                }
-                            }
-                            if (!response || response.status !== 200) {
-                                logger.error("All attempts failed. Exiting application.")
+                            if (attempt < 9) {
+                                logger.error(
+                                    `Attempt ${attempt + 1}/10 failed for user ${username} in group ${group}${messageSuffix}: ${reason}. Retrying in 30 sec...`
+                                )
+                                attempt++
+                                await delay(30000)
+                            } else {
+                                fatalError = true
                                 runStats.failed++
-                                process.exit(1)
+                                logger.error(
+                                    `All attempts failed for user ${username} in group ${group}. Reason: ${reason}. Exiting application.`
+                                )
+                                break
                             }
-                            finalStatus = response.status
                         }
                     }
-
-                    if (skipUpdate) {
-                        await delay(100)
-                        continue
-                    }
-
-                    const statusForLog = typeof finalStatus === "number" ? finalStatus : null
-                    if (statusForLog === 200) runStats.succeeded++
-                    else runStats.failed++
-
-                    const audioMessage = stream.audioStreamId ? `Audio ID ${stream.audioStreamId}` : ""
-                    const subtitleMessage = stream.subtitleStreamId >= 0 ? `Subtitle ID ${stream.subtitleStreamId}` : ""
-                    const updateMessage = [audioMessage, subtitleMessage].filter(Boolean).join(" and ")
-                    logger.debug(
-                        `Update ${updateMessage} for user ${username} in group ${group}: ${
-                            statusForLog === 200 ? "SUCCESS" : "FAIL"
-                        }`
-                    )
-                } catch (error) {
-                    handleAxiosError(`posting update for user '${username}' in group '${group}'`, error)
                 }
-                await delay(100) // 50ms delay
+
+                const duration = Date.now() - startTime
+                const transition = buildStreamTransition(stream)
+                auditWriter.append({
+                    timestamp: new Date(startTime).toISOString(),
+                    libraryName,
+                    ratingKey: stream.ratingKey,
+                    partId: stream.partId,
+                    title: stream.title,
+                    group,
+                    user: username,
+                    actionType: describeActionType(stream),
+                    ...transition,
+                    status: skipUpdate ? "skipped" : userSummary.status || "error",
+                    reason,
+                    httpStatus,
+                    durationMs: duration,
+                })
+
+                if (!skipUpdate && !userSummary.status) {
+                    userSummary.status = httpStatus === 200 ? "success" : "error"
+                    if (httpStatus !== 200) userSummary.reason = reason
+                }
+
+                if (skipUpdate) {
+                    await delay(100)
+                    summary.users.push(userSummary)
+                    continue
+                }
+
+                const statusForLog = httpStatus
+                const audioMessage = stream.audioStreamId ? `Audio ID ${stream.audioStreamId}` : ""
+                const subtitleMessage =
+                    stream.subtitleStreamId >= 0 ? `Subtitle ID ${stream.subtitleStreamId}` : ""
+                const updateMessage = [audioMessage, subtitleMessage].filter(Boolean).join(" and ")
+                logger.debug(
+                    `Update ${updateMessage} for user ${username} in group ${group}: ${
+                        statusForLog === 200 ? "SUCCESS" : "FAIL"
+                    }`
+                )
+
+                summary.users.push(userSummary)
+                if (fatalError) {
+                    emitUserSummary(summary)
+                    closeAuditWriter()
+                    process.exit(1)
+                }
+                await delay(100)
             }
+
             logger.info(`Part ID ${stream.partId}: update complete for group ${group}`)
+            emitUserSummary(summary)
         }
     }
 }
@@ -699,7 +987,7 @@ const performPartialRun = async (cleanRun) => {
                 }
 
                 if (Object.keys(newStreams).length > 0) {
-                    await updateDefaultStreamsPerItem(newStreams, config.filters[libraryName], usersWithAccess)
+                    await updateDefaultStreamsPerItem(libraryName, newStreams, usersWithAccess)
                 }
 
                 // Optional: Delay between processing each item to reduce load
@@ -720,7 +1008,7 @@ const performPartialRun = async (cleanRun) => {
                     }
 
                     if (Object.keys(newStreams).length > 0) {
-                        await updateDefaultStreamsPerItem(newStreams, config.filters[libraryName], usersWithAccess)
+                        await updateDefaultStreamsPerItem(libraryName, newStreams, usersWithAccess)
                     }
 
                     // Optional: Delay between processing each stream to reduce load
@@ -775,58 +1063,18 @@ app.post("/webhook", async (req, res) => {
         }
         // else do nothing
 
-        const updates = []
+        const updates = {}
         for (const group in filters) {
             const newStreams = await identifyStreamsToUpdate(streams, filters[group])
             if (!newStreams || newStreams.length === 0) {
                 logger.info("Could not find streams to update. Ending request")
                 continue
             }
-            updates.push({ group, newStreams })
+            updates[group] = newStreams
         }
 
-        for (const { group, newStreams } of updates) {
-            let usernames = usersWithAccess.get(group)
-            if (usernames.length === 0) {
-                logger.warn(`No users found in group '${group}'. Skipping update.`)
-                continue
-            }
-
-            for (const username of usernames) {
-                const token = USERS.get(username)
-                if (!token) {
-                    logger.warn(`No access token found for user '${username}'. Skipping update.`)
-                    continue
-                }
-
-                for (const stream of newStreams) {
-                    const queryParams = new URLSearchParams()
-                    if (stream.audioStreamId) queryParams.append("audioStreamID", stream.audioStreamId)
-                    if (stream.subtitleStreamId >= 0) queryParams.append("subtitleStreamID", stream.subtitleStreamId)
-
-                    try {
-                        const response = await axiosInstance.post(
-                            `/library/parts/${stream.partId}?${queryParams.toString()}`,
-                            {},
-                            { headers: { "X-Plex-Token": token } }
-                        )
-
-                        const audioMessage = stream.audioStreamId ? `Audio ID ${stream.audioStreamId}` : ""
-                        const subtitleMessage = stream.subtitleStreamId ? `Subtitle ID ${stream.subtitleStreamId}` : ""
-                        const updateMessage = [audioMessage, subtitleMessage].filter(Boolean).join(" and ")
-                        logger.info(
-                            `Update ${updateMessage} for user ${username} in group ${group}: ${
-                                response.status === 200 ? "SUCCESS" : "FAIL"
-                            }`
-                        )
-                    } catch (error) {
-                        handleAxiosError(`posting update for user '${username}' in group '${group}'`, error)
-                    }
-
-                    // Optional: Delay between posting each update to reduce load
-                    await delay(100) // 50ms delay
-                }
-            }
+        if (Object.keys(updates).length > 0) {
+            await updateDefaultStreamsPerItem(libraryName, updates, usersWithAccess)
         }
 
         logger.info("Tautulli webhook finished")
@@ -838,8 +1086,25 @@ app.post("/webhook", async (req, res) => {
 })
 
 // Handle uncaught exceptions and unhandled rejections
-process.on("uncaughtException", (error) => logger.error(`Uncaught exception: ${error.message}`))
-process.on("unhandledRejection", (reason) => logger.error(`Unhandled rejection: ${reason}`))
+process.on("uncaughtException", (error) => {
+    logger.error(`Uncaught exception: ${error.message}`)
+    closeAuditWriter()
+})
+process.on("unhandledRejection", (reason) => {
+    logger.error(`Unhandled rejection: ${reason}`)
+    closeAuditWriter()
+})
+process.on("SIGINT", () => {
+    closeAuditWriter()
+    process.exit(1)
+})
+process.on("SIGTERM", () => {
+    closeAuditWriter()
+    process.exit(1)
+})
+process.on("exit", () => {
+    closeAuditWriter()
+})
 
 // Initializing the application
 const PORT = process.env.PORT || 3184
@@ -853,6 +1118,8 @@ app.listen(PORT, async () => {
         if (USERS.size === 0) throw new Error("No users with access to libraries detected")
 
         warnAboutSharedTokens()
+        logGroupDigest()
+        logOwnerSafety()
 
         if (config.dry_run) await performDryRun()
         else if (config.partial_run_on_start) await performPartialRun()

@@ -65,12 +65,54 @@ See [config.yaml](https://github.com/varthe/Defaulterr/blob/main/config.yaml) fo
 
 #### RUN SETTINGS
 
-- **dry_run**: Set to `True` to test filters. This mode won't update users and is recommended to verify that your filters work correctly. It overwrites other run settings.
+- **dry_run**: Set to `True` to test filters. This mode won't update users and is recommended to verify that your filters work correctly. It overwrites other run settings. You can also enable it at runtime with `--dry-run` or `DRY_RUN=1` (CLI options override environment variables, which override config values).
 - **partial_run_on_start**: Set to `True` to do a partial run on application start.
   - **WARNING**: The first run may take a LONG time to complete as it will update all existing media. Subsequent runs will only update any new items added since the last run.
 - **partial_run_cron_expression**: Specify a cron expression (e.g., `0 3 * * *` for daily at 3:00 AM) to do a partial run on a schedule. You can create and check cron expressions at [https://crontab.guru/](https://crontab.guru/).
 - **clean_run_on_start**: Set to `True` to update all existing media on application start. Should only be used if you want to re-apply a new set of filters on your libraries.
 - **skipInaccessibleItems**: Set to `True` to skip per-user updates that return HTTP 403 because the user can't access the item. When enabled the run will continue, log skip counts per user, and finish with exit code `0`. Defaults to `False`. You can also enable it via the `SKIP_INACCESSIBLE_ITEMS` environment variable.
+
+#### DIAGNOSTIC FLAGS & ENVIRONMENT VARIABLES
+
+Additional runtime switches control the new diagnostics tooling. CLI options always override environment variables, which override the values defined in `config.yaml`.
+
+| CLI flag | Environment variable | Description |
+| --- | --- | --- |
+| `--log-user-summary[=true|false]` | `LOG_USER_SUMMARY` | Emit a human-readable per-item, per-group summary after each update. |
+| `--log-json-user-summary[=true|false]` | `LOG_JSON_USER_SUMMARY` | Emit a machine-friendly JSON summary line alongside (or instead of) the human summary. |
+| `--audit-dir=<path>` | `AUDIT_DIR` | Write per-run audit reports to the given directory (JSON + CSV). Files are created as `run-YYYYMMDD-HHMMSS.json` / `.csv`. |
+| `--dry-run` | `DRY_RUN` | Shortcut to enable dry-run mode without editing the config file. |
+
+Example JSON summary:
+
+```
+[INFO]: {"event":"user_updates","group":"noLossless","partId":23614,"title":"1917","library":"Movies Home","users":[{"name":"keltonsnyder","audio":{"id":12345,"label":"AC3 5.1"},"status":"success"},{"name":"rossni6","status":"skipped","reason":"HTTP 403"}]}
+```
+
+Example human-readable summary:
+
+```
+[INFO]: User updates (group=noLossless, part=23614, title='1917'):
+  keltonsnyder: audio='AC3 5.1' (id=12345) [success]
+  rossni6: [skipped: HTTP 403]
+```
+
+When a run starts, Defaulterr emits a startup digest and an owner-safety message to make it clear which groups will run and whether the Plex owner is included:
+
+```
+[INFO]: Group digest (library='Movies Home'):
+  - noLossless: members=keltonsnyder,davidantillon,rossni6 (3)
+    resolvedTokens: 3/3 ok; restrictedAccess: 0 (updates skipped for missing tokens)
+[INFO]: Owner 'Tristan' is not included in any group; no owner updates will be performed.
+```
+
+If the owner is intentionally targeted the message becomes a warning so it stands out during reviews.
+
+#### AUDIT OUTPUTS
+
+Providing `--audit-dir` (or setting `AUDIT_DIR`) enables structured per-run audit exports. Each run writes two files—`run-YYYYMMDD-HHMMSS.json` and `run-YYYYMMDD-HHMMSS.csv`—with one row per `(group, user, item)` attempt. Columns include timestamps, library names, rating keys, stream transitions, HTTP status codes, duration, and final status (`success`, `skipped`, `error`, or `dry_run`).
+
+Audit files are written incrementally with buffered streams to keep the runtime overhead low. Disable the flag (default) to skip audit generation entirely.
 
 #### GROUPS
 
@@ -109,7 +151,7 @@ managed_users:
   user2: token
 ```
 
-> **Important:** Plex keeps default audio/subtitle selections per Plex account, not per managed profile. If multiple entries share the same token (for example, the owner and the managed profiles underneath it), any update for one will affect all of them. Defaulterr logs a warning when it detects token reuse so you know shared preferences are in play.
+> **Important:** Plex keeps default audio/subtitle selections per Plex account, not per managed profile. If multiple entries share the same token (for example, the owner and the managed profiles underneath it), any update for one will affect all of them. Defaulterr logs a warning when it detects token reuse so you know shared preferences are in play. Some Plex clients may also display managed profile preferences as if they carry across profiles—double-check the audit trail if behaviour looks unexpected.
 
 #### FILTERS
 
