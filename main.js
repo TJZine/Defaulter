@@ -63,6 +63,25 @@ const logRunSummary = () => {
     })
 }
 
+const warnAboutSharedTokens = () => {
+    const tokenToUsers = new Map()
+    USERS.forEach((token, username) => {
+        if (!token) return
+        const normalizedToken = token.trim()
+        if (!normalizedToken) return
+        const list = tokenToUsers.get(normalizedToken) || []
+        list.push(username)
+        tokenToUsers.set(normalizedToken, list)
+    })
+
+    tokenToUsers.forEach((usernames) => {
+        if (usernames.length <= 1) return
+        logger.warn(
+            `Users ${usernames.join(", ")} share the same Plex token. Plex applies default stream selections per account, so updates for one profile will impact the others.`
+        )
+    })
+}
+
 if (config.skipInaccessibleItems) {
     logger.info("skipInaccessibleItems enabled: HTTP 403 responses will be skipped per user/item.")
 }
@@ -832,6 +851,8 @@ app.listen(PORT, async () => {
         }
         await fetchAllUsersListedInFilters()
         if (USERS.size === 0) throw new Error("No users with access to libraries detected")
+
+        warnAboutSharedTokens()
 
         if (config.dry_run) await performDryRun()
         else if (config.partial_run_on_start) await performPartialRun()

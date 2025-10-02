@@ -6,3 +6,4 @@
 - Run summary logging that reports processed, succeeded, failed, and skipped updates along with per-user skip counts.
 - GitHub Actions workflow to build and publish Docker images to GHCR on pushes,
   tags, and manual runs.
+- Detection and warning for shared Plex tokens so operators know when profiles will share playback defaults, plus documentation of the limitation.

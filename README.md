@@ -109,6 +109,8 @@ managed_users:
   user2: token
 ```
 
+> **Important:** Plex keeps default audio/subtitle selections per Plex account, not per managed profile. If multiple entries share the same token (for example, the owner and the managed profiles underneath it), any update for one will affect all of them. Defaulterr logs a warning when it detects token reuse so you know shared preferences are in play.
+
 #### FILTERS
 
 Filters define how audio and subtitle streams are updated based on specified criteria. The structure in `config.yaml` is as follows:
