@@ -1,11 +1,11 @@
 const fs = require("fs")
 const yaml = require("js-yaml")
 const logger = require("./logger")
+const cliOptions = require("./cliOptions")
 const Ajv = require("ajv")
 const ajv = new Ajv()
 
-// Path to YAML file
-const yamlFilePath = process.argv[3] || "./config.yaml"
+const yamlFilePath = cliOptions.getFlag("config") || cliOptions.positional[1] || "./config.yaml"
 
 // Define the updated validation schema
 const schema = {
@@ -24,6 +24,9 @@ const schema = {
             type: "object",
             additionalProperties: { type: "string" },
         },
+        logUserSummary: { type: "boolean" },
+        logJsonUserSummary: { type: "boolean" },
+        auditDir: { type: "string" },
         groups: {
             type: "object",
             patternProperties: {

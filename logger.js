@@ -2,8 +2,10 @@ const path = require("path")
 const winston = require("winston")
 const DailyRotateFile = require("winston-daily-rotate-file")
 
+const cliOptions = require("./cliOptions")
+
 const logLevel = process.env.LOG_LEVEL || "info"
-const filePath = process.argv[2] || "./logs"
+const filePath = cliOptions.positional[0] || "./logs"
 
 const logger = winston.createLogger({
     level: logLevel,
