@@ -7,14 +7,84 @@ const cronValidator = require("cron-validator")
 const xml2js = require("xml2js")
 const loadAndValidateYAML = require("./configBuilder")
 
+const parseBoolean = (value) => {
+    if (typeof value === "boolean") return value
+    if (typeof value === "string") {
+        const normalized = value.trim().toLowerCase()
+        if (["1", "true", "yes", "on"].includes(normalized)) return true
+        if (["0", "false", "no", "off"].includes(normalized)) return false
+    }
+    return undefined
+}
+
 const config = loadAndValidateYAML()
+const envSkipInaccessibleItems = parseBoolean(process.env.SKIP_INACCESSIBLE_ITEMS)
+if (typeof envSkipInaccessibleItems === "boolean") {
+    config.skipInaccessibleItems = envSkipInaccessibleItems
+}
 const app = express()
 app.use(express.json())
 
 const STREAM_TYPES = { video: 1, audio: 2, subtitles: 3 }
 const LIBRARIES = new Map()
 const USERS = new Map()
+const runStats = {
+    processed: 0,
+    succeeded: 0,
+    failed: 0,
+    skipped: 0,
+    skippedByUser: {},
+}
 const timestampsFile = process.argv[4] || "./last_run_timestamps.json"
+
+const resetRunStats = () => {
+    runStats.processed = 0
+    runStats.succeeded = 0
+    runStats.failed = 0
+    runStats.skipped = 0
+    runStats.skippedByUser = {}
+}
+
+const recordSkipForUser = (username) => {
+    runStats.skipped++
+    runStats.skippedByUser[username] = (runStats.skippedByUser[username] || 0) + 1
+}
+
+const logRunSummary = () => {
+    logger.info(
+        `Run summary: processed=${runStats.processed}, succeeded=${runStats.succeeded}, failed=${runStats.failed}, skipped=${runStats.skipped}`
+    )
+    if (Object.keys(runStats.skippedByUser).length === 0) {
+        logger.info("skippedInaccessibleItemsByUser: none")
+        return
+    }
+    Object.entries(runStats.skippedByUser).forEach(([user, count]) => {
+        logger.info(`skippedInaccessibleItemsByUser[${user}] = ${count}`)
+    })
+}
+
+const warnAboutSharedTokens = () => {
+    const tokenToUsers = new Map()
+    USERS.forEach((token, username) => {
+        if (!token) return
+        const normalizedToken = token.trim()
+        if (!normalizedToken) return
+        const list = tokenToUsers.get(normalizedToken) || []
+        list.push(username)
+        tokenToUsers.set(normalizedToken, list)
+    })
+
+    tokenToUsers.forEach((usernames) => {
+        if (usernames.length <= 1) return
+        logger.warn(
+            `Users ${usernames.join(", ")} share the same Plex token. Plex applies default stream selections per account, so updates for one profile will impact the others.`
+        )
+    })
+}
+
+if (config.skipInaccessibleItems) {
+    logger.info("skipInaccessibleItems enabled: HTTP 403 responses will be skipped per user/item.")
+}
 
 // Create an Axios instance with increased timeout and keep-alive
 const axiosInstance = axios.create({
@@ -427,6 +497,8 @@ const updateDefaultStreamsPerItem = async (streamsToUpdate, filters, users) => {
                 continue
             }
             for (const username of usernames) {
+                let skipUpdate = false
+                let finalStatus
                 const token = USERS.get(username)
                 if (!token) {
                     logger.warn(`No access token found for user ${username}. Skipping update.`)
@@ -436,54 +508,82 @@ const updateDefaultStreamsPerItem = async (streamsToUpdate, filters, users) => {
                 if (stream.audioStreamId) queryParams.append("audioStreamID", stream.audioStreamId)
                 if (stream.subtitleStreamId >= 0) queryParams.append("subtitleStreamID", stream.subtitleStreamId)
 
+                runStats.processed++
+
                 try {
-                    const response = await axiosInstance
-                        .post(
+                    let response
+                    try {
+                        response = await axiosInstance.post(
                             `/library/parts/${stream.partId}?${queryParams.toString()}`,
                             {},
                             { headers: { "X-Plex-Token": token } }
                         )
-                        .catch(async (error) => {
+                        finalStatus = response.status
+                    } catch (error) {
+                        const statusCode = error.response?.status ?? error.status
+                        if (statusCode === 403 && config.skipInaccessibleItems) {
+                            skipUpdate = true
+                            recordSkipForUser(username)
+                            const itemLabel = stream.title
+                                ? `'${stream.title}' (Part ID ${stream.partId})`
+                                : `Part ID ${stream.partId}`
+                            logger.warn(
+                                `Skipping item ${itemLabel} for user ${username} in group ${group}: inaccessible (HTTP 403).`
+                            )
+                        } else {
+                            const messageSuffix =
+                                statusCode === 403
+                                    ? ". This could be because of age ratings, ensure they can access ALL items in the library"
+                                    : ""
+                            const baseMessage = error.message || error.response?.statusText || "Unknown error"
                             logger.error(
-                                `Error while posting update for user ${username} in group ${group}${
-                                    error.status === 403
-                                        ? ". This could be because of age ratings, ensure they can access ALL items in the library"
-                                        : ""
-                                }: ${error.message}. Retrying in 30 sec...`
+                                `Error while posting update for user ${username} in group ${group}${messageSuffix}: ${baseMessage}. Retrying in 30 sec...`
                             )
                             await delay(30000)
                             let responseStatus = ""
                             let attempt = 1
                             while (responseStatus !== 200 && attempt < 10) {
-                                await axiosInstance
-                                    .post(
+                                try {
+                                    response = await axiosInstance.post(
                                         `/library/parts/${stream.partId}?${queryParams.toString()}`,
                                         {},
                                         { headers: { "X-Plex-Token": token } }
                                     )
-                                    .then((response) => (responseStatus = response.status))
-                                    .catch((error) => {
-                                        logger.error(
-                                            `Attempt ${attempt}/10 failed with error: ${error.message}. Retrying in 30 sec...`
-                                        )
-                                    })
+                                    responseStatus = response.status
+                                } catch (retryError) {
+                                    logger.error(
+                                        `Attempt ${attempt}/10 failed with error: ${retryError.message}. Retrying in 30 sec...`
+                                    )
+                                }
                                 if (responseStatus !== 200) {
                                     attempt++
                                     await delay(30000)
                                 }
                             }
-                            if (responseStatus !== 200) {
-                                logger.error("All attemps failed. Exiting application.")
+                            if (!response || response.status !== 200) {
+                                logger.error("All attempts failed. Exiting application.")
+                                runStats.failed++
                                 process.exit(1)
                             }
-                        })
+                            finalStatus = response.status
+                        }
+                    }
+
+                    if (skipUpdate) {
+                        await delay(100)
+                        continue
+                    }
+
+                    const statusForLog = typeof finalStatus === "number" ? finalStatus : null
+                    if (statusForLog === 200) runStats.succeeded++
+                    else runStats.failed++
 
                     const audioMessage = stream.audioStreamId ? `Audio ID ${stream.audioStreamId}` : ""
                     const subtitleMessage = stream.subtitleStreamId >= 0 ? `Subtitle ID ${stream.subtitleStreamId}` : ""
                     const updateMessage = [audioMessage, subtitleMessage].filter(Boolean).join(" and ")
                     logger.debug(
                         `Update ${updateMessage} for user ${username} in group ${group}: ${
-                            response.status === 200 ? "SUCCESS" : "FAIL"
+                            statusForLog === 200 ? "SUCCESS" : "FAIL"
                         }`
                     )
                 } catch (error) {
@@ -556,6 +656,7 @@ const performDryRun = async () => {
 // Partial run: process items updated since last run
 const performPartialRun = async (cleanRun) => {
     await fetchAllLibraries()
+    resetRunStats()
 
     logger.info(`STARTING ${cleanRun ? "CLEAN" : "PARTIAL"} RUN`)
 
@@ -636,6 +737,7 @@ const performPartialRun = async (cleanRun) => {
     // Save the updated timestamps for future runs
     if (Object.keys(newTimestamps).length > 0) saveLastRunTimestamps({ ...lastRunTimestamps, ...newTimestamps })
 
+    logRunSummary()
     logger.info(`FINISHED ${cleanRun ? "CLEAN" : "PARTIAL"} RUN`)
 }
 
@@ -749,6 +851,8 @@ app.listen(PORT, async () => {
         }
         await fetchAllUsersListedInFilters()
         if (USERS.size === 0) throw new Error("No users with access to libraries detected")
+
+        warnAboutSharedTokens()
 
         if (config.dry_run) await performDryRun()
         else if (config.partial_run_on_start) await performPartialRun()
